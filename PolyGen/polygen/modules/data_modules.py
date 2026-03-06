@@ -13,6 +13,7 @@ import torchvision.transforms as T
 from pytorch3d.io import load_obj
 import pytorch_lightning as pl
 from PIL import Image
+import numpy as np
 
 import polygen.utils.data_utils as data_utils
 
@@ -24,6 +25,7 @@ class ShapenetDataset(Dataset):
         default_shapenet: bool = True,
         all_files: Optional[List[str]] = None,
         label_dict: Dict[str, int] = None,
+        num_input_points: int = 2048,
     ) -> None:
         """
         Args:
@@ -31,6 +33,7 @@ class ShapenetDataset(Dataset):
         """
         self.training_dir = training_dir
         self.default_shapenet = default_shapenet
+        self.num_input_points = num_input_points
         if default_shapenet:
             self.all_files = glob.glob(f"{self.training_dir}/*/*/models/model_normalized.obj")
             self.label_dict = {}
@@ -39,6 +42,18 @@ class ShapenetDataset(Dataset):
         else:
             self.all_files = all_files
             self.label_dict = label_dict
+
+    def _sample_point_cloud(self, vertices: torch.Tensor) -> torch.Tensor:
+        """Samples a fixed-size point cloud from normalized mesh vertices."""
+        num_vertices = vertices.shape[0]
+        if num_vertices == 0:
+            return torch.zeros([self.num_input_points, 3], dtype=torch.float32)
+        if num_vertices >= self.num_input_points:
+            indices = torch.randperm(num_vertices)[: self.num_input_points]
+        else:
+            extra = torch.randint(0, num_vertices, (self.num_input_points - num_vertices,))
+            indices = torch.cat([torch.arange(num_vertices), extra], dim=0)
+        return vertices[indices].to(torch.float32)
 
     def __len__(self) -> int:
         """Returns number of 3D objects"""
@@ -57,6 +72,7 @@ class ShapenetDataset(Dataset):
         vertices = vertices[:, [2, 0, 1]]
         vertices = data_utils.center_vertices(vertices)
         vertices = data_utils.normalize_vertices_scale(vertices)
+        point_cloud = self._sample_point_cloud(vertices)
         vertices, faces, _ = data_utils.quantize_process_mesh(vertices, faces)
         faces = data_utils.flatten_faces(faces)
         vertices = vertices.to(torch.int32)
@@ -65,7 +81,7 @@ class ShapenetDataset(Dataset):
             class_label = self.label_dict[mesh_file.split("/")[-4]]
         else:
             class_label = self.label_dict[mesh_file]
-        mesh_dict = {"vertices": vertices, "faces": faces, "class_label": class_label}
+        mesh_dict = {"vertices": vertices, "faces": faces, "class_label": class_label, "point_cloud": point_cloud}
         return mesh_dict
 
 
@@ -111,10 +127,181 @@ class ImageDataset(Dataset):
         return mesh_dict
 
 
+class PairedObjXyzDataset(Dataset):
+    """Dataset for paired building meshes and LiDAR point clouds.
+
+    Expected directory structure:
+      root/
+        meshes/*.obj
+        pointclouds/*.xyz
+    where files are paired by stem, e.g. `1.obj` <-> `1.xyz`.
+    """
+
+    def __init__(
+        self,
+        root_dir: str,
+        num_input_points: int = 2048,
+        voxel_size: float = 0.01,
+        max_xyz_abs: float = 1e6,
+        max_retry: int = 20,
+        bad_sample_log_file: str = "bad_xyz_samples.log",
+    ) -> None:
+        self.root_dir = root_dir
+        self.mesh_dir = os.path.join(root_dir, "meshes")
+        self.pointcloud_dir = os.path.join(root_dir, "pointclouds")
+        self.num_input_points = num_input_points
+        self.voxel_size = voxel_size
+        self.max_xyz_abs = max_xyz_abs
+        self.max_retry = max_retry
+        self.bad_sample_log_file = os.path.join(root_dir, bad_sample_log_file)
+
+        if (not os.path.isdir(self.mesh_dir)) or (not os.path.isdir(self.pointcloud_dir)):
+            raise FileNotFoundError(
+                f"Expected paired folders under {root_dir}: meshes/ and pointclouds/."
+            )
+
+        mesh_files = glob.glob(os.path.join(self.mesh_dir, "*.obj"))
+        pc_files = glob.glob(os.path.join(self.pointcloud_dir, "*.xyz"))
+
+        mesh_map = {os.path.splitext(os.path.basename(p))[0]: p for p in mesh_files}
+        pc_map = {os.path.splitext(os.path.basename(p))[0]: p for p in pc_files}
+
+        shared_keys = sorted(set(mesh_map.keys()) & set(pc_map.keys()))
+        if len(shared_keys) == 0:
+            raise RuntimeError(f"No paired .obj/.xyz files found under {root_dir}.")
+
+        self.pairs = [(mesh_map[k], pc_map[k]) for k in shared_keys]
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def _log_bad_sample(self, mesh_file: str, xyz_file: str, reason: str) -> None:
+        with open(self.bad_sample_log_file, "a", encoding="utf-8") as f:
+            f.write(f"mesh={mesh_file}\txyz={xyz_file}\treason={reason}\n")
+
+    def _read_xyz_robust(self, xyz_file: str) -> torch.Tensor:
+        valid_points = []
+        bad_line_count = 0
+        with open(xyz_file, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                parts = stripped.split()
+                if len(parts) < 3:
+                    bad_line_count += 1
+                    continue
+                try:
+                    x = float(parts[0])
+                    y = float(parts[1])
+                    z = float(parts[2])
+                except ValueError:
+                    bad_line_count += 1
+                    continue
+                if (not np.isfinite(x)) or (not np.isfinite(y)) or (not np.isfinite(z)):
+                    bad_line_count += 1
+                    continue
+                if (abs(x) > self.max_xyz_abs) or (abs(y) > self.max_xyz_abs) or (abs(z) > self.max_xyz_abs):
+                    bad_line_count += 1
+                    continue
+                valid_points.append([x, y, z])
+        if len(valid_points) == 0:
+            raise RuntimeError("no valid xyz points after filtering")
+        points = torch.tensor(valid_points, dtype=torch.float32)
+        if bad_line_count > 0:
+            # Keep sample but record that some lines were discarded.
+            self._log_bad_sample("-", xyz_file, f"dropped_bad_lines={bad_line_count}")
+        return points
+
+    @staticmethod
+    def _farthest_point_sample(points: torch.Tensor, target_n: int) -> torch.Tensor:
+        n = points.shape[0]
+        if n <= target_n:
+            return points
+        sampled_idx = torch.zeros(target_n, dtype=torch.long)
+        distances = torch.full((n,), float("inf"), dtype=torch.float32)
+        farthest = torch.randint(0, n, (1,), dtype=torch.long).item()
+        for i in range(target_n):
+            sampled_idx[i] = farthest
+            centroid = points[farthest]
+            dist = torch.sum((points - centroid) ** 2, dim=1)
+            distances = torch.minimum(distances, dist)
+            farthest = torch.argmax(distances).item()
+        return points[sampled_idx]
+
+    def _voxel_downsample(self, points: torch.Tensor) -> torch.Tensor:
+        if self.voxel_size <= 0:
+            return points
+        pts_np = points.cpu().numpy()
+        voxel_idx = np.floor(pts_np / self.voxel_size).astype(np.int64)
+        _, unique_idx = np.unique(voxel_idx, axis=0, return_index=True)
+        unique_idx = np.sort(unique_idx)
+        return points[torch.from_numpy(unique_idx).to(torch.long)]
+
+    def _sample_point_cloud(self, points: torch.Tensor) -> torch.Tensor:
+        if points.shape[0] == 0:
+            return torch.zeros([self.num_input_points, 3], dtype=torch.float32)
+        points = self._voxel_downsample(points)
+        if points.shape[0] >= self.num_input_points:
+            points = self._farthest_point_sample(points, self.num_input_points)
+            return points.to(torch.float32)
+        extra = torch.randint(0, points.shape[0], (self.num_input_points - points.shape[0],))
+        points = torch.cat([points, points[extra]], dim=0)
+        return points.to(torch.float32)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        attempts = 0
+        curr_idx = idx
+        while attempts < self.max_retry:
+            mesh_file, xyz_file = self.pairs[curr_idx]
+            try:
+                mesh_vertices, faces, _ = load_obj(mesh_file)
+                faces = faces.verts_idx
+                # Keep coordinate convention consistent with existing PolyGen pipeline.
+                mesh_vertices = mesh_vertices[:, [2, 0, 1]]
+
+                xyz_points = self._read_xyz_robust(xyz_file)[:, [2, 0, 1]]
+
+                # Align both condition and target with the same mesh-derived normalization.
+                vert_min, _ = torch.min(mesh_vertices, dim=0)
+                vert_max, _ = torch.max(mesh_vertices, dim=0)
+                center = 0.5 * (vert_min + vert_max)
+                extents = vert_max - vert_min
+                scale = torch.sqrt(torch.sum(extents ** 2))
+                if torch.isclose(scale, torch.tensor(0.0, device=scale.device)):
+                    scale = torch.tensor(1.0, device=scale.device)
+
+                mesh_vertices = (mesh_vertices - center) / scale
+                xyz_points = (xyz_points - center) / scale
+                point_cloud = self._sample_point_cloud(xyz_points)
+
+                mesh_vertices, faces, _ = data_utils.quantize_process_mesh(mesh_vertices, faces)
+                faces = data_utils.flatten_faces(faces)
+                mesh_vertices = mesh_vertices.to(torch.int32)
+                faces = faces.to(torch.int32)
+
+                # class_label is unused in point-cloud mode but kept for compatibility.
+                return {
+                    "vertices": mesh_vertices,
+                    "faces": faces,
+                    "class_label": 0,
+                    "point_cloud": point_cloud,
+                }
+            except Exception as e:
+                self._log_bad_sample(mesh_file, xyz_file, str(e))
+                attempts += 1
+                curr_idx = random.randint(0, len(self.pairs) - 1)
+        raise RuntimeError(
+            f"Exceeded max retries ({self.max_retry}) when loading valid paired sample. "
+            f"See {self.bad_sample_log_file}"
+        )
+
+
 class CollateMethod(Enum):
     VERTICES = 1
     FACES = 2
     IMAGES = 3
+    POINT_CLOUD = 4
 
 
 class PolygenDataModule(pl.LightningDataModule):
@@ -128,7 +315,13 @@ class PolygenDataModule(pl.LightningDataModule):
         default_shapenet: bool = True,
         quantization_bits: int = 8,
         use_image_dataset: bool = False,
+        use_point_cloud_dataset: bool = False,
         img_extension: str = "jpeg",
+        num_input_points: int = 2048,
+        point_cloud_voxel_size: float = 0.01,
+        point_cloud_max_xyz_abs: float = 1e6,
+        point_cloud_max_retry: int = 20,
+        point_cloud_bad_sample_log_file: str = "bad_xyz_samples.log",
         all_files: Optional[List[str]] = None,
         label_dict: Optional[Dict[str, int]] = None,
         apply_random_shift_vertices: bool = True,
@@ -157,7 +350,9 @@ class PolygenDataModule(pl.LightningDataModule):
         # If we are using the image dataset, then the collate method should not be for
         # class-conditioned vertices. It should be for image-conditioned vertices
         # or vertex-conditioned faces
-        assert (use_image_dataset and (not collate_method == CollateMethod.VERTICES)) or (not use_image_dataset)
+        assert (not use_image_dataset) or (collate_method == CollateMethod.IMAGES)
+        assert (not use_point_cloud_dataset) or (collate_method == CollateMethod.POINT_CLOUD)
+        assert not (use_image_dataset and use_point_cloud_dataset)
         assert (training_split + val_split) <= 1.0
 
         self.data_dir = data_dir
@@ -165,12 +360,24 @@ class PolygenDataModule(pl.LightningDataModule):
 
         if use_image_dataset:
             self.shapenet_dataset = ImageDataset(training_dir=self.data_dir, image_extension=img_extension)
+        elif use_point_cloud_dataset and os.path.isdir(os.path.join(self.data_dir, "meshes")) and os.path.isdir(
+            os.path.join(self.data_dir, "pointclouds")
+        ):
+            self.shapenet_dataset = PairedObjXyzDataset(
+                root_dir=self.data_dir,
+                num_input_points=num_input_points,
+                voxel_size=point_cloud_voxel_size,
+                max_xyz_abs=point_cloud_max_xyz_abs,
+                max_retry=point_cloud_max_retry,
+                bad_sample_log_file=point_cloud_bad_sample_log_file,
+            )
         else:
             self.shapenet_dataset = ShapenetDataset(
                 self.data_dir,
                 default_shapenet=default_shapenet,
                 all_files=all_files,
                 label_dict=label_dict,
+                num_input_points=num_input_points,
             )
 
         self.training_split = training_split
@@ -186,6 +393,8 @@ class PolygenDataModule(pl.LightningDataModule):
             self.collate_fn = self.collate_face_model_batch
         elif collate_method == CollateMethod.IMAGES:
             self.collate_fn = self.collate_img_model_batch
+        elif collate_method == CollateMethod.POINT_CLOUD:
+            self.collate_fn = self.collate_point_cloud_model_batch
 
     def collate_vertex_model_batch(self, ds: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         """Applying padding to different length vertex sequences so we can batch them
@@ -319,6 +528,33 @@ class PolygenDataModule(pl.LightningDataModule):
         img_vertex_model_batch["vertex_tokens_mask"] = vertex_tokens_mask
         img_vertex_model_batch["image"] = images
         return img_vertex_model_batch
+
+    def collate_point_cloud_model_batch(self, ds: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        """Applies vertex padding and batches input point clouds."""
+        pc_vertex_model_batch = {}
+        num_vertices_list = [shape_dict["vertices"].shape[0] for shape_dict in ds]
+        max_vertices = max(num_vertices_list)
+        num_elements = len(ds)
+
+        vertex_tokens = torch.zeros([num_elements, max_vertices + 1], dtype=torch.int32)
+        vertices_zyx = torch.zeros([num_elements, max_vertices, 3], dtype=torch.int32)
+        vertex_tokens_mask = torch.zeros_like(vertex_tokens, dtype=torch.int32)
+        point_clouds = torch.stack([shape_dict["point_cloud"] for shape_dict in ds], dim=0).to(torch.float32)
+
+        for i, element in enumerate(ds):
+            vertices = element["vertices"]
+            initial_vertex_size = vertices.shape[0]
+            vertices_zyx[i, :initial_vertex_size] = torch.stack(
+                [vertices[..., 2], vertices[..., 1], vertices[..., 0]], dim=-1
+            )
+            vertex_tokens[i, :initial_vertex_size] = 1
+            vertex_tokens_mask[i, : initial_vertex_size + 1] = 1
+
+        pc_vertex_model_batch["vertex_tokens"] = vertex_tokens
+        pc_vertex_model_batch["vertices_zyx"] = vertices_zyx
+        pc_vertex_model_batch["vertex_tokens_mask"] = vertex_tokens_mask
+        pc_vertex_model_batch["point_cloud"] = point_clouds
+        return pc_vertex_model_batch
 
     def setup(self, stage: Optional = None) -> None:
         """Pytorch Lightning Data Module setup method"""

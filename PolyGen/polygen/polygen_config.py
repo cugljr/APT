@@ -2,7 +2,7 @@ from typing import Any, Dict, Optional
 
 import torch
 
-from polygen.modules.vertex_model import VertexModel, ImageToVertexModel
+from polygen.modules.vertex_model import VertexModel, ImageToVertexModel, PointCloudToVertexModel
 from polygen.modules.face_model import FaceModel
 from polygen.modules.data_modules import PolygenDataModule, CollateMethod
 
@@ -27,11 +27,23 @@ class VertexModelConfig:
         gamma: float,
         training_steps: int,
         image_model: bool = False,
+        point_cloud_model: bool = False,
+        num_input_points: int = 2048,
+        num_context_tokens: int = 256,
+        point_cloud_knn_scales: Optional[list] = None,
+        geometric_loss_weight: float = 0.1,
+        chamfer_max_points: int = 1024,
+        point_cloud_voxel_size: float = 0.01,
+        point_cloud_max_xyz_abs: float = 1e6,
+        point_cloud_max_retry: int = 20,
+        point_cloud_bad_sample_log_file: str = "bad_xyz_samples.log",
+        gpu_ids: Optional[list] = None,
     ) -> None:
         """Initializes vertex model and vertex data module
 
         Args:
             accelerator: data parallel or distributed data parallel
+            gpu_ids: GPU ids to use, e.g. [0, 1]. If None, use all visible GPUs.
             dataset_path: Root directory for shapenet dataset
             batch_size: How many 3D objects in one batch
             training_split: What proportion of data to use for training the model
@@ -48,9 +60,20 @@ class VertexModelConfig:
             gamma: Decay rate for lr scheduler
             training_steps: How many total steps we want to train for
             image_model: Whether we're training the image model or class-conditioned model
+            point_cloud_model: Whether we're training point-cloud-conditioned vertex model
+            num_input_points: Number of input points sampled per object for condition
+            num_context_tokens: Number of condition tokens passed to decoder cross-attention
+            point_cloud_knn_scales: kNN neighborhood sizes for multi-scale point-cloud encoding
+            geometric_loss_weight: Weight for Chamfer geometric consistency loss
+            chamfer_max_points: Number of condition points used in Chamfer computation
+            point_cloud_voxel_size: Voxel size for point-cloud downsampling in paired dataset
+            point_cloud_max_xyz_abs: Absolute-value cap when filtering invalid xyz rows
+            point_cloud_max_retry: Retry count for skipping corrupted samples
+            point_cloud_bad_sample_log_file: Log file name for rejected xyz samples
         """
 
-        self.num_gpus = torch.cuda.device_count()
+        self.gpu_ids = gpu_ids
+        self.num_gpus = torch.cuda.device_count() if gpu_ids is None else len(gpu_ids)
         self.accelerator = accelerator
         if accelerator.startswith("ddp"):
             self.batch_size = batch_size // self.num_gpus
@@ -67,6 +90,23 @@ class VertexModelConfig:
                 learning_rate = learning_rate,
                 step_size = step_size,
                 gamma = gamma,
+            )
+        elif point_cloud_model:
+            collate_method = CollateMethod.POINT_CLOUD
+            if point_cloud_knn_scales is None:
+                point_cloud_knn_scales = [8, 16, 32]
+            self.vertex_model = PointCloudToVertexModel(
+                decoder_config=decoder_config,
+                quantization_bits=quantization_bits,
+                use_discrete_embeddings=use_discrete_embeddings,
+                max_num_input_verts=max_num_input_verts,
+                learning_rate=learning_rate,
+                step_size=step_size,
+                gamma=gamma,
+                num_context_tokens=num_context_tokens,
+                knn_scales=tuple(point_cloud_knn_scales),
+                geometric_loss_weight=geometric_loss_weight,
+                chamfer_max_points=chamfer_max_points,
             )
         else:
             collate_method = CollateMethod.VERTICES
@@ -90,8 +130,14 @@ class VertexModelConfig:
             training_split=training_split,
             val_split=val_split,
             quantization_bits=quantization_bits,
-            use_image_dataset = image_model,
-            apply_random_shift_vertices=apply_random_shift,
+            use_image_dataset=image_model,
+            use_point_cloud_dataset=point_cloud_model,
+            num_input_points=num_input_points,
+            point_cloud_voxel_size=point_cloud_voxel_size,
+            point_cloud_max_xyz_abs=point_cloud_max_xyz_abs,
+            point_cloud_max_retry=point_cloud_max_retry,
+            point_cloud_bad_sample_log_file=point_cloud_bad_sample_log_file,
+            apply_random_shift_vertices=(apply_random_shift and (not point_cloud_model)),
         )
 
         self.training_steps = training_steps
@@ -118,11 +164,13 @@ class FaceModelConfig:
         step_size: int,
         gamma: float,
         training_steps: int,
+        gpu_ids: Optional[list] = None,
     ):
         """Initializes face model and face data module
 
         Args:
             accelerator: data parallel or distributed data parallel
+            gpu_ids: GPU ids to use, e.g. [0, 1]. If None, use all visible GPUs.
             dataset_path: Root directory for shapenet dataset
             batch_size: How many 3D objects in one batch
             training_split: What proportion of data to use for training the model
@@ -143,7 +191,8 @@ class FaceModelConfig:
             training_steps: How many total steps we want to train for
         """
 
-        self.num_gpus = torch.cuda.device_count()
+        self.gpu_ids = gpu_ids
+        self.num_gpus = torch.cuda.device_count() if gpu_ids is None else len(gpu_ids)
         self.accelerator = accelerator
         if accelerator.startswith("ddp"):
             self.batch_size = batch_size // self.num_gpus

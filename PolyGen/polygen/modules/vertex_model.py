@@ -11,6 +11,7 @@ from polygen.utils.data_utils import dequantize_verts
 from .polygen_decoder import TransformerDecoder
 from .utils import top_k_logits, top_p_logits
 from .image_encoder import PolygenResnet
+from .point_cloud_encoder import APESPointCloudEncoder
 
 
 class VertexModel(pl.LightningModule):
@@ -32,6 +33,8 @@ class VertexModel(pl.LightningModule):
         learning_rate: float = 3e-4,
         step_size: int = 5000,
         gamma: float = 0.9995,
+        geometric_loss_weight: float = 0.0,
+        chamfer_max_points: int = 1024,
     ) -> None:
         """Initializes VertexModel. The encoder can be a model with a Resnet backbone for image contexts and voxel contexts.
         However for class label context, the encoder is simply the class embedder.
@@ -46,6 +49,8 @@ class VertexModel(pl.LightningModule):
             learning_rate: Learning rate for adam optimizer
             step_size: How often to use lr scheduler
             gamma: Decay rate for lr scheduler
+            geometric_loss_weight: Weight for geometric consistency loss.
+            chamfer_max_points: Max points used from condition point cloud for chamfer.
         """
 
         super(VertexModel, self).__init__()
@@ -74,6 +79,43 @@ class VertexModel(pl.LightningModule):
         self.learning_rate = learning_rate
         self.step_size = step_size
         self.gamma = gamma
+        self.geometric_loss_weight = geometric_loss_weight
+        self.chamfer_max_points = chamfer_max_points
+
+    def _predicted_vertices_xyz(self, logits: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Decodes predicted quantized z-y-x logits into dequantized x-y-z vertices."""
+        pred_z = torch.argmax(logits["z_logits"][:, :-1], dim=-1)
+        pred_y = torch.argmax(logits["y_logits"][:, :-1], dim=-1)
+        pred_x = torch.argmax(logits["x_logits"][:, :-1], dim=-1)
+        pred_zyx = torch.stack([pred_z, pred_y, pred_x], dim=-1)
+        pred_xyz = dequantize_verts(pred_zyx, self.quantization_bits)
+        pred_xyz = torch.stack([pred_xyz[..., 2], pred_xyz[..., 1], pred_xyz[..., 0]], dim=-1)
+        return pred_xyz
+
+    def _chamfer_loss(
+        self,
+        pred_xyz: torch.Tensor,
+        pred_mask: torch.Tensor,
+        point_cloud: torch.Tensor,
+    ) -> torch.Tensor:
+        """Computes symmetric Chamfer distance between predicted vertices and condition point cloud."""
+        losses = []
+        batch_size = pred_xyz.shape[0]
+        for b in range(batch_size):
+            pred_pts = pred_xyz[b][pred_mask[b] > 0.5]
+            cond_pts = point_cloud[b]
+            if pred_pts.shape[0] == 0 or cond_pts.shape[0] == 0:
+                continue
+            if cond_pts.shape[0] > self.chamfer_max_points:
+                rand_idx = torch.randperm(cond_pts.shape[0], device=cond_pts.device)[: self.chamfer_max_points]
+                cond_pts = cond_pts[rand_idx]
+            dists = torch.cdist(pred_pts.unsqueeze(0), cond_pts.unsqueeze(0)).squeeze(0)
+            d_pred_to_pc = torch.mean(torch.min(dists, dim=1).values)
+            d_pc_to_pred = torch.mean(torch.min(dists, dim=0).values)
+            losses.append(d_pred_to_pc + d_pc_to_pred)
+        if len(losses) == 0:
+            return torch.tensor(0.0, device=pred_xyz.device)
+        return torch.stack(losses).mean()
 
     def _embed_class_label(self, labels: torch.Tensor) -> torch.Tensor:
         """Embeds Class Label with learned embedding matrix
@@ -282,11 +324,21 @@ class VertexModel(pl.LightningModule):
             * coord_mask
         )
         vertex_loss = stop_loss + z_loss + y_loss + x_loss
+        geometric_loss = torch.tensor(0.0, device=vertex_loss.device)
+        if self.geometric_loss_weight > 0 and "point_cloud" in vertex_model_batch:
+            pred_xyz = self._predicted_vertices_xyz(logits)
+            geometric_loss = self._chamfer_loss(
+                pred_xyz=pred_xyz,
+                pred_mask=coord_mask,
+                point_cloud=vertex_model_batch["point_cloud"].to(torch.float32),
+            )
+            vertex_loss = vertex_loss + self.geometric_loss_weight * geometric_loss
         self.log("train_loss", vertex_loss)
         self.log("train_stop_loss", stop_loss)
         self.log("train_z_loss", z_loss)
         self.log("train_y_loss", y_loss)
         self.log("train_x_loss", x_loss)
+        self.log("train_geo_loss", geometric_loss)
         return vertex_loss
 
     def configure_optimizers(self) -> Dict[str, Any]:
@@ -344,11 +396,21 @@ class VertexModel(pl.LightningModule):
                 * coord_mask
             )
             vertex_loss = stop_loss + z_loss + y_loss + x_loss
+            geometric_loss = torch.tensor(0.0, device=vertex_loss.device)
+            if self.geometric_loss_weight > 0 and "point_cloud" in val_batch:
+                pred_xyz = self._predicted_vertices_xyz(logits)
+                geometric_loss = self._chamfer_loss(
+                    pred_xyz=pred_xyz,
+                    pred_mask=coord_mask,
+                    point_cloud=val_batch["point_cloud"].to(torch.float32),
+                )
+                vertex_loss = vertex_loss + self.geometric_loss_weight * geometric_loss
         self.log("val_loss", vertex_loss)
         self.log("val_stop_loss", stop_loss)
         self.log("val_z_loss", z_loss)
         self.log("val_y_loss", y_loss)
         self.log("val_x_loss", x_loss)
+        self.log("val_geo_loss", geometric_loss)
         return vertex_loss
 
     def sample(
@@ -578,4 +640,50 @@ class ImageToVertexModel(VertexModel):
         batch_size = image_embeddings.shape[0]
         sequential_context_embeddings = torch.reshape(image_embeddings, [batch_size, -1, self.embedding_dim])
 
+        return None, sequential_context_embeddings
+
+
+class PointCloudToVertexModel(VertexModel):
+    def __init__(
+        self,
+        decoder_config: Dict[str, Any],
+        quantization_bits: int,
+        use_discrete_embeddings: bool = True,
+        max_num_input_verts: int = 2500,
+        learning_rate: float = 3e-4,
+        step_size: int = 5000,
+        gamma: float = 0.9995,
+        num_context_tokens: int = 256,
+        knn_scales: Tuple[int, ...] = (8, 16, 32),
+        geometric_loss_weight: float = 0.1,
+        chamfer_max_points: int = 1024,
+    ) -> None:
+        """Vertex model conditioned on point clouds.
+
+        Uses an APES-inspired encoder to convert point clouds into
+        sequential context tokens for decoder cross-attention.
+        """
+        super(PointCloudToVertexModel, self).__init__(
+            decoder_config=decoder_config,
+            quantization_bits=quantization_bits,
+            max_num_input_verts=max_num_input_verts,
+            use_discrete_embeddings=use_discrete_embeddings,
+            learning_rate=learning_rate,
+            step_size=step_size,
+            gamma=gamma,
+            geometric_loss_weight=geometric_loss_weight,
+            chamfer_max_points=chamfer_max_points,
+        )
+        self.pc_encoder = APESPointCloudEncoder(
+            hidden_size=self.embedding_dim,
+            num_context_tokens=num_context_tokens,
+            knn_scales=knn_scales,
+        )
+
+    def _prepare_context(self, context: Dict[str, torch.Tensor]) -> Tuple[None, torch.Tensor]:
+        """Creates sequential context embeddings from point cloud condition."""
+        if "point_cloud" not in context:
+            raise KeyError("point_cloud key is required for PointCloudToVertexModel.")
+        pc = context["point_cloud"]
+        sequential_context_embeddings = self.pc_encoder(pc)
         return None, sequential_context_embeddings

@@ -2,6 +2,7 @@ import pdb
 
 import torch
 import pytorch_lightning as pl
+import argparse
 
 import hydra
 from hydra.utils import instantiate
@@ -24,12 +25,19 @@ def main(config_name: str) -> None:
 
     trainer = pl.Trainer(
         accelerator=vertex_model_config.accelerator,
-        gpus=vertex_model_config.num_gpus,
+        gpus=vertex_model_config.gpu_ids if vertex_model_config.gpu_ids is not None else vertex_model_config.num_gpus,
         max_epochs=num_epochs,
     )
     trainer.fit(model=vertex_model, datamodule=vertex_data_module)
 
 
 if __name__ == "__main__":
-    # main(config_name = "vertex_model_config_1231.yaml") #To train class conditioned model
-    main(config_name="image_model_config_105.yaml")  # To train image conditioned model
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config_name",
+        type=str,
+        default="point_cloud_model_config.yaml",
+        help="Hydra config file under polygen/config.",
+    )
+    args = parser.parse_args()
+    main(config_name=args.config_name)
