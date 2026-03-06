@@ -1,19 +1,13 @@
 VertexModelConfig:
   _target_: polygen.polygen_config.VertexModelConfig
   accelerator: ddp
-  gpu_ids: [0, 1]
-  dataset_path: "/coc/scratch/aahluwalia30/shapenet/shapenetcore/shapenet-lite/"
+  gpu_ids: [ 1 ]
+  dataset_path: "/home/kemove/devdata1/zyx/datasets/Tallinn"
   batch_size: 12
   training_split: 0.80
   val_split: 0.10
   apply_random_shift: True
-  decoder_config:
-    {
-      "hidden_size": 256,
-      "fc_size": 1024,
-      "num_layers": 18,
-      "dropout_rate": 0.2
-    }
+  decoder_config: { "hidden_size": 256, "fc_size": 1024, "num_layers": 18, "dropout_rate": 0.2 }
   quantization_bits: 8
   class_conditional: False
   num_classes: 55
@@ -27,7 +21,7 @@ VertexModelConfig:
   point_cloud_model: True
   num_input_points: 2048
   num_context_tokens: 256
-  point_cloud_knn_scales: [8, 16, 32]
+  point_cloud_knn_scales: [ 8, 16, 32 ]
   geometric_loss_weight: 0.1
   chamfer_max_points: 1024
   point_cloud_voxel_size: 0.01

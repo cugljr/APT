@@ -21,11 +21,34 @@ def main(config_name: str) -> None:
     training_steps = vertex_model_config.training_steps
     batch_size = vertex_model_config.batch_size
     dataset_length = len(vertex_data_module.shapenet_dataset)
-    num_epochs = training_steps * batch_size // (dataset_length)
+    if dataset_length <= 0:
+        data_dir = getattr(vertex_data_module, "data_dir", "<unknown>")
+        raise RuntimeError(
+            "Dataset is empty (len(dataset) == 0). "
+            f"Check your config `{config_name}` and dataset_path/data_dir. "
+            f"Resolved data_dir={data_dir!r}. "
+            "For point-cloud mode, the directory must contain paired "
+            "`meshes/*.obj` and `pointclouds/*.xyz` with matching filename stems."
+        )
+
+    num_epochs = training_steps * batch_size // dataset_length
+    num_epochs = max(1, int(num_epochs))
+
+    # PyTorch Lightning >= 2.0 uses `devices` instead of `gpus`.
+    cfg_accel = getattr(vertex_model_config, "accelerator", "auto")
+    use_gpu = torch.cuda.is_available()
+    accelerator = "gpu" if use_gpu else "cpu"
+    strategy = "ddp" if str(cfg_accel).startswith("ddp") else "auto"
+
+    if getattr(vertex_model_config, "gpu_ids", None) is not None:
+        devices = vertex_model_config.gpu_ids
+    else:
+        devices = vertex_model_config.num_gpus if use_gpu else 1
 
     trainer = pl.Trainer(
-        accelerator=vertex_model_config.accelerator,
-        gpus=vertex_model_config.gpu_ids if vertex_model_config.gpu_ids is not None else vertex_model_config.num_gpus,
+        accelerator=accelerator,
+        devices=devices,
+        strategy=strategy,
         max_epochs=num_epochs,
     )
     trainer.fit(model=vertex_model, datamodule=vertex_data_module)
