@@ -1,4 +1,5 @@
-import pdb
+import csv
+import os
 
 import torch
 import pytorch_lightning as pl
@@ -8,6 +9,40 @@ import hydra
 from hydra.utils import instantiate
 
 from polygen.polygen_config import VertexModelConfig
+
+
+class ValidationResultsCallback(pl.Callback):
+    """每个 epoch 将验证指标追加到 CSV 文件。"""
+
+    def __init__(self, save_dir: str = "lightning_logs"):
+        self.save_dir = save_dir
+        self.results_file = os.path.join(save_dir, "validation_results.csv")
+        self._header_written = False
+
+    def _write_header(self, val_keys: list):
+        os.makedirs(self.save_dir, exist_ok=True)
+        with open(self.results_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["epoch"] + val_keys)
+        self._header_written = True
+
+    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        metrics = trainer.callback_metrics
+        val_keys = [k for k in sorted(metrics) if k.startswith("val_")]
+        if not val_keys:
+            return
+        if not self._header_written:
+            self._write_header(val_keys)
+        def _to_scalar(v):
+            if isinstance(v, torch.Tensor):
+                return v.item()
+            return v
+
+        epoch = _to_scalar(metrics.get("epoch", trainer.current_epoch))
+        row = [epoch] + [_to_scalar(metrics.get(k, "")) for k in val_keys]
+        with open(self.results_file, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
 
 
 def main(config_name: str) -> None:
@@ -53,12 +88,38 @@ def main(config_name: str) -> None:
             name=getattr(vertex_model_config, "wandb_run_name", None),
         )
 
+    ckpt_dir = "lightning_logs/checkpoints"
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # 1. 验证 loss 最低的 1 个权重
+    best_ckpt = pl.callbacks.ModelCheckpoint(
+        dirpath=ckpt_dir,
+        filename="best-val_loss={val_loss:.2f}-epoch={epoch:02d}",
+        monitor="val_loss",
+        mode="min",
+        save_top_k=1,
+        every_n_epochs=1,
+    )
+    # 2. 最新的 5 个权重（按 epoch 从大到小保留）
+    latest_ckpt = pl.callbacks.ModelCheckpoint(
+        dirpath=ckpt_dir,
+        filename="latest-epoch={epoch:02d}",
+        monitor="epoch",
+        mode="max",
+        save_top_k=5,
+        every_n_epochs=1,
+    )
+    # 3. 每个 epoch 保存验证结果到 CSV
+    val_results_cb = ValidationResultsCallback(save_dir="lightning_logs")
+
     trainer = pl.Trainer(
         accelerator=accelerator,
         devices=devices,
         strategy=strategy,
         max_epochs=num_epochs,
         logger=logger,
+        callbacks=[best_ckpt, latest_ckpt, val_results_cb],
+        default_root_dir="lightning_logs",
     )
     trainer.fit(model=vertex_model, datamodule=vertex_data_module)
 
