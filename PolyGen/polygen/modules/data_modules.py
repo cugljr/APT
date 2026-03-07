@@ -127,6 +127,17 @@ class ImageDataset(Dataset):
         return mesh_dict
 
 
+def _count_vertices_in_obj(mesh_path: str) -> int:
+    """Count vertex lines in an OBJ file (lines starting with 'v ')."""
+    count = 0
+    with open(mesh_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            s = line.strip()
+            if s.startswith("v ") and not s.startswith("vn ") and not s.startswith("vt "):
+                count += 1
+    return count
+
+
 class PairedObjXyzDataset(Dataset):
     """Dataset for paired building meshes and LiDAR point clouds.
 
@@ -145,6 +156,7 @@ class PairedObjXyzDataset(Dataset):
         max_xyz_abs: float = 1e6,
         max_retry: int = 20,
         bad_sample_log_file: str = "bad_xyz_samples.log",
+        max_vertices_per_sample: Optional[int] = None,
     ) -> None:
         self.root_dir = root_dir
         self.mesh_dir = os.path.join(root_dir, "meshes")
@@ -171,6 +183,21 @@ class PairedObjXyzDataset(Dataset):
             raise RuntimeError(f"No paired .obj/.xyz files found under {root_dir}.")
 
         self.pairs = [(mesh_map[k], pc_map[k]) for k in shared_keys]
+
+        if max_vertices_per_sample is not None:
+            filtered = []
+            for mesh_path, xyz_path in self.pairs:
+                try:
+                    nv = _count_vertices_in_obj(mesh_path)
+                    if nv <= max_vertices_per_sample:
+                        filtered.append((mesh_path, xyz_path))
+                except Exception:
+                    continue
+            self.pairs = filtered
+            if len(self.pairs) == 0:
+                raise RuntimeError(
+                    f"No paired samples with <= {max_vertices_per_sample} vertices under {root_dir}."
+                )
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -322,6 +349,7 @@ class PolygenDataModule(pl.LightningDataModule):
         point_cloud_max_xyz_abs: float = 1e6,
         point_cloud_max_retry: int = 20,
         point_cloud_bad_sample_log_file: str = "bad_xyz_samples.log",
+        max_vertices_per_sample: Optional[int] = None,
         all_files: Optional[List[str]] = None,
         label_dict: Optional[Dict[str, int]] = None,
         apply_random_shift_vertices: bool = True,
@@ -370,6 +398,7 @@ class PolygenDataModule(pl.LightningDataModule):
                 max_xyz_abs=point_cloud_max_xyz_abs,
                 max_retry=point_cloud_max_retry,
                 bad_sample_log_file=point_cloud_bad_sample_log_file,
+                max_vertices_per_sample=max_vertices_per_sample,
             )
         else:
             self.shapenet_dataset = ShapenetDataset(
@@ -386,6 +415,7 @@ class PolygenDataModule(pl.LightningDataModule):
         self.apply_random_shift_vertices = apply_random_shift_vertices
         self.apply_random_shift_faces = apply_random_shift_faces
         self.shuffle_vertices = shuffle_vertices
+        self.max_vertices_per_sample = max_vertices_per_sample
 
         if collate_method == CollateMethod.VERTICES:
             self.collate_fn = self.collate_vertex_model_batch
@@ -406,6 +436,8 @@ class PolygenDataModule(pl.LightningDataModule):
         vertex_model_batch = {}
         num_vertices_list = [shape_dict["vertices"].shape[0] for shape_dict in ds]
         max_vertices = max(num_vertices_list)
+        if self.max_vertices_per_sample is not None:
+            max_vertices = min(max_vertices, self.max_vertices_per_sample)
         num_elements = len(ds)
         vertex_tokens = torch.zeros([num_elements, max_vertices + 1], dtype=torch.int32)
         vertices_zyx = torch.zeros([num_elements, max_vertices, 3], dtype=torch.int32)
@@ -416,11 +448,12 @@ class PolygenDataModule(pl.LightningDataModule):
             if self.apply_random_shift_vertices:
                 vertices = data_utils.random_shift(vertices)
             initial_vertex_size = vertices.shape[0]
+            n = min(initial_vertex_size, max_vertices)
             curr_vertices_zyx = torch.stack([vertices[..., 2], vertices[..., 1], vertices[..., 0]], dim=-1)
-            vertices_zyx[i, :initial_vertex_size] = curr_vertices_zyx
-            vertex_tokens[i, :initial_vertex_size] = 1
+            vertices_zyx[i, :n] = curr_vertices_zyx[:n]
+            vertex_tokens[i, :n] = 1
             class_labels[i] = torch.Tensor([element["class_label"]])
-            vertex_tokens_mask[i, : initial_vertex_size + 1] = 1
+            vertex_tokens_mask[i, : n + 1] = 1
         vertex_model_batch["vertex_tokens"] = vertex_tokens
         vertex_model_batch["vertices_zyx"] = vertices_zyx
         vertex_model_batch["class_label"] = class_labels
@@ -499,6 +532,8 @@ class PolygenDataModule(pl.LightningDataModule):
         img_vertex_model_batch = {}
         num_vertices_list = [shape_dict["vertices"].shape[0] for shape_dict in ds]
         max_vertices = max(num_vertices_list)
+        if self.max_vertices_per_sample is not None:
+            max_vertices = min(max_vertices, self.max_vertices_per_sample)
         num_elements = len(ds)
         vertex_tokens = torch.zeros([num_elements, max_vertices + 1], dtype=torch.int32)
         vertices_zyx = torch.zeros([num_elements, max_vertices, 3], dtype=torch.int32)
@@ -515,11 +550,12 @@ class PolygenDataModule(pl.LightningDataModule):
         for i, element in enumerate(ds):
             vertices = element["vertices"]
             initial_vertex_size = vertices.shape[0]
-            vertices_zyx[i, :initial_vertex_size] = torch.stack(
+            n = min(initial_vertex_size, max_vertices)
+            vertices_zyx[i, :n] = torch.stack(
                 [vertices[..., 2], vertices[..., 1], vertices[..., 0]], dim=-1
-            )
-            vertex_tokens[i, :initial_vertex_size] = 1
-            vertex_tokens_mask[i, : initial_vertex_size + 1] = 1
+            )[:n]
+            vertex_tokens[i, :n] = 1
+            vertex_tokens_mask[i, : n + 1] = 1
 
             images[i] = element["image"]
 
@@ -530,10 +566,12 @@ class PolygenDataModule(pl.LightningDataModule):
         return img_vertex_model_batch
 
     def collate_point_cloud_model_batch(self, ds: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        """Applies vertex padding and batches input point clouds."""
+        """Applies vertex padding and batches input point clouds. Caps vertex count to max_vertices_per_sample if set."""
         pc_vertex_model_batch = {}
         num_vertices_list = [shape_dict["vertices"].shape[0] for shape_dict in ds]
         max_vertices = max(num_vertices_list)
+        if self.max_vertices_per_sample is not None:
+            max_vertices = min(max_vertices, self.max_vertices_per_sample)
         num_elements = len(ds)
 
         vertex_tokens = torch.zeros([num_elements, max_vertices + 1], dtype=torch.int32)
@@ -544,11 +582,12 @@ class PolygenDataModule(pl.LightningDataModule):
         for i, element in enumerate(ds):
             vertices = element["vertices"]
             initial_vertex_size = vertices.shape[0]
-            vertices_zyx[i, :initial_vertex_size] = torch.stack(
+            n = min(initial_vertex_size, max_vertices)
+            vertices_zyx[i, :n] = torch.stack(
                 [vertices[..., 2], vertices[..., 1], vertices[..., 0]], dim=-1
-            )
-            vertex_tokens[i, :initial_vertex_size] = 1
-            vertex_tokens_mask[i, : initial_vertex_size + 1] = 1
+            )[:n]
+            vertex_tokens[i, :n] = 1
+            vertex_tokens_mask[i, : n + 1] = 1
 
         pc_vertex_model_batch["vertex_tokens"] = vertex_tokens
         pc_vertex_model_batch["vertices_zyx"] = vertices_zyx

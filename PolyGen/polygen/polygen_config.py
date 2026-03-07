@@ -38,6 +38,9 @@ class VertexModelConfig:
         point_cloud_max_retry: int = 20,
         point_cloud_bad_sample_log_file: str = "bad_xyz_samples.log",
         gpu_ids: Optional[list] = None,
+        use_wandb: bool = False,
+        wandb_project: str = "polygen",
+        wandb_run_name: Optional[str] = None,
     ) -> None:
         """Initializes vertex model and vertex data module
 
@@ -70,10 +73,16 @@ class VertexModelConfig:
             point_cloud_max_xyz_abs: Absolute-value cap when filtering invalid xyz rows
             point_cloud_max_retry: Retry count for skipping corrupted samples
             point_cloud_bad_sample_log_file: Log file name for rejected xyz samples
+            use_wandb: Whether to use Weights & Biases for logging
+            wandb_project: W&B project name
+            wandb_run_name: W&B run name (None for auto)
         """
 
         self.gpu_ids = gpu_ids
         self.num_gpus = torch.cuda.device_count() if gpu_ids is None else len(gpu_ids)
+        self.use_wandb = use_wandb
+        self.wandb_project = wandb_project
+        self.wandb_run_name = wandb_run_name
         self.accelerator = accelerator
         if accelerator.startswith("ddp"):
             self.batch_size = batch_size // self.num_gpus
@@ -137,6 +146,7 @@ class VertexModelConfig:
             point_cloud_max_xyz_abs=point_cloud_max_xyz_abs,
             point_cloud_max_retry=point_cloud_max_retry,
             point_cloud_bad_sample_log_file=point_cloud_bad_sample_log_file,
+            max_vertices_per_sample=max_num_input_verts,
             apply_random_shift_vertices=(apply_random_shift and (not point_cloud_model)),
         )
 

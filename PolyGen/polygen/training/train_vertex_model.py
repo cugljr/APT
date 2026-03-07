@@ -45,11 +45,20 @@ def main(config_name: str) -> None:
     else:
         devices = vertex_model_config.num_gpus if use_gpu else 1
 
+    logger = None
+    if getattr(vertex_model_config, "use_wandb", False):
+        from pytorch_lightning.loggers import WandbLogger
+        logger = WandbLogger(
+            project=getattr(vertex_model_config, "wandb_project", "polygen"),
+            name=getattr(vertex_model_config, "wandb_run_name", None),
+        )
+
     trainer = pl.Trainer(
         accelerator=accelerator,
         devices=devices,
         strategy=strategy,
         max_epochs=num_epochs,
+        logger=logger,
     )
     trainer.fit(model=vertex_model, datamodule=vertex_data_module)
 
