@@ -92,7 +92,7 @@ class LatestKCheckpointsCallback(pl.Callback):
 
 
 def main(config_name: str) -> None:
-    with hydra.initialize_config_module(config_module="polygen.config"):
+    with hydra.initialize_config_module(config_module="polygen.config", version_base=None):
         cfg = hydra.compose(config_name=config_name)
         vertex_model_config = instantiate(cfg.VertexModelConfig)
 
@@ -153,6 +153,12 @@ def main(config_name: str) -> None:
     latest_k_ckpt = LatestKCheckpointsCallback(ckpt_dir=ckpt_dir, keep_last_k=5)
     # 3) 每个 epoch 保存验证结果到 CSV（写到当前 run 目录）
     val_results_cb = ValidationResultsCallback(save_dir=log_dir)
+    early_stopping_cb = pl.callbacks.EarlyStopping(
+        monitor="val_loss_mean",
+        mode="min",
+        patience=getattr(vertex_model_config, "early_stopping_patience", 10),
+        min_delta=getattr(vertex_model_config, "early_stopping_min_delta", 0.0),
+    )
 
     # logger：本地 CSV + （可选）wandb
     if logger is None:
@@ -166,7 +172,7 @@ def main(config_name: str) -> None:
         strategy=strategy,
         max_epochs=num_epochs,
         logger=loggers,
-        callbacks=[best_ckpt, latest_k_ckpt, val_results_cb],
+        callbacks=[best_ckpt, latest_k_ckpt, val_results_cb, early_stopping_cb],
     )
     trainer.fit(model=vertex_model, datamodule=vertex_data_module)
 

@@ -35,6 +35,10 @@ class VertexModel(pl.LightningModule):
         gamma: float = 0.9995,
         geometric_loss_weight: float = 0.0,
         chamfer_max_points: int = 1024,
+        stop_loss_weight: float = 1.0,
+        length_loss_weight: float = 0.0,
+        length_loss_type: str = "huber",
+        length_huber_delta: float = 10.0,
     ) -> None:
         """Initializes VertexModel. The encoder can be a model with a Resnet backbone for image contexts and voxel contexts.
         However for class label context, the encoder is simply the class embedder.
@@ -51,6 +55,10 @@ class VertexModel(pl.LightningModule):
             gamma: Decay rate for lr scheduler
             geometric_loss_weight: Weight for geometric consistency loss.
             chamfer_max_points: Max points used from condition point cloud for chamfer.
+            stop_loss_weight: Weight of stop-token loss term.
+            length_loss_weight: Weight of vertex-count consistency loss.
+            length_loss_type: One of {"huber", "l1"}.
+            length_huber_delta: Beta in smooth L1 for length loss.
         """
 
         super(VertexModel, self).__init__()
@@ -81,6 +89,10 @@ class VertexModel(pl.LightningModule):
         self.gamma = gamma
         self.geometric_loss_weight = geometric_loss_weight
         self.chamfer_max_points = chamfer_max_points
+        self.stop_loss_weight = stop_loss_weight
+        self.length_loss_weight = length_loss_weight
+        self.length_loss_type = length_loss_type
+        self.length_huber_delta = length_huber_delta
 
     def _predicted_vertices_xyz(self, logits: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Decodes predicted quantized z-y-x logits into dequantized x-y-z vertices."""
@@ -116,6 +128,22 @@ class VertexModel(pl.LightningModule):
         if len(losses) == 0:
             return torch.tensor(0.0, device=pred_xyz.device)
         return torch.stack(losses).mean()
+
+    def _length_consistency_loss(self, stop_logits: torch.Tensor, token_targets: torch.Tensor) -> torch.Tensor:
+        """Computes loss between predicted and GT number of vertices."""
+        # stop_logits/token_targets shape: [B, L], where L = V + 1 and stop token is 0.
+        pred_tokens = torch.argmax(stop_logits, dim=-1)
+        pred_stop_mask = pred_tokens == 0
+        has_stop = pred_stop_mask.any(dim=1)
+        first_stop = torch.argmax(pred_stop_mask.to(torch.int32), dim=1)
+        max_valid = token_targets.shape[1] - 1
+        pred_num_vertices = torch.where(has_stop, first_stop, torch.full_like(first_stop, max_valid)).to(torch.float32)
+        gt_num_vertices = torch.sum((token_targets[:, :-1] == 1).to(torch.float32), dim=1)
+
+        if self.length_loss_type == "l1":
+            return torch.mean(torch.abs(pred_num_vertices - gt_num_vertices))
+        # default huber
+        return F.smooth_l1_loss(pred_num_vertices, gt_num_vertices, beta=self.length_huber_delta, reduction="mean")
 
     def _embed_class_label(self, labels: torch.Tensor) -> torch.Tensor:
         """Embeds Class Label with learned embedding matrix
@@ -327,14 +355,17 @@ class VertexModel(pl.LightningModule):
             )
             * coord_mask
         )
-        vertex_loss = stop_loss + z_loss + y_loss + x_loss
+        length_loss = self._length_consistency_loss(logits["stop_logits"], token_targets)
+        vertex_loss = self.stop_loss_weight * stop_loss + z_loss + y_loss + x_loss
+        vertex_loss = vertex_loss + self.length_loss_weight * length_loss
 
         # per-token mean losses (more interpretable than sums)
         stop_loss_mean = stop_loss / token_denom
         z_loss_mean = z_loss / coord_denom
         y_loss_mean = y_loss / coord_denom
         x_loss_mean = x_loss / coord_denom
-        vertex_loss_mean = stop_loss_mean + z_loss_mean + y_loss_mean + x_loss_mean
+        vertex_loss_mean = self.stop_loss_weight * stop_loss_mean + z_loss_mean + y_loss_mean + x_loss_mean
+        vertex_loss_mean = vertex_loss_mean + self.length_loss_weight * length_loss
 
         geometric_loss = torch.tensor(0.0, device=vertex_loss.device)
         if self.geometric_loss_weight > 0 and "point_cloud" in vertex_model_batch:
@@ -352,6 +383,7 @@ class VertexModel(pl.LightningModule):
         self.log("train_y_loss", y_loss)
         self.log("train_x_loss", x_loss)
         self.log("train_geo_loss", geometric_loss)
+        self.log("train_len_loss", length_loss)
 
         # new normalized metrics
         self.log("train_loss_mean", vertex_loss_mean, prog_bar=True)
@@ -421,13 +453,16 @@ class VertexModel(pl.LightningModule):
                 )
                 * coord_mask
             )
-            vertex_loss = stop_loss + z_loss + y_loss + x_loss
+            length_loss = self._length_consistency_loss(logits["stop_logits"], token_targets)
+            vertex_loss = self.stop_loss_weight * stop_loss + z_loss + y_loss + x_loss
+            vertex_loss = vertex_loss + self.length_loss_weight * length_loss
 
             stop_loss_mean = stop_loss / token_denom
             z_loss_mean = z_loss / coord_denom
             y_loss_mean = y_loss / coord_denom
             x_loss_mean = x_loss / coord_denom
-            vertex_loss_mean = stop_loss_mean + z_loss_mean + y_loss_mean + x_loss_mean
+            vertex_loss_mean = self.stop_loss_weight * stop_loss_mean + z_loss_mean + y_loss_mean + x_loss_mean
+            vertex_loss_mean = vertex_loss_mean + self.length_loss_weight * length_loss
 
             geometric_loss = torch.tensor(0.0, device=vertex_loss.device)
             if self.geometric_loss_weight > 0 and "point_cloud" in val_batch:
@@ -444,6 +479,7 @@ class VertexModel(pl.LightningModule):
         self.log("val_y_loss", y_loss)
         self.log("val_x_loss", x_loss)
         self.log("val_geo_loss", geometric_loss)
+        self.log("val_len_loss", length_loss)
 
         self.log("val_loss_mean", vertex_loss_mean, prog_bar=True)
         self.log("val_stop_loss_mean", stop_loss_mean)
@@ -598,9 +634,10 @@ class VertexModel(pl.LightningModule):
         pad_size = max_sample_length - vertices.shape[1]
         vertices = F.pad(vertices, [0, 0, 0, pad_size, 0, 0])
 
-        vertices_mask = (torch.arange(max_sample_length)[None] < num_vertices[:, None]).to(
+        vertices_mask = (torch.arange(max_sample_length, device=num_vertices.device)[None] < num_vertices[:, None]).to(
             torch.float32
-        )  # Provides a mask of which vertices to zero out as they were produced after stop token for that batch ended
+        )
+
 
         if recenter_verts:
             vert_max, _ = torch.max(vertices - 1e10 * (1.0 - vertices_mask)[..., None], dim=1, keepdim=True)
@@ -698,6 +735,10 @@ class PointCloudToVertexModel(VertexModel):
         knn_scales: Tuple[int, ...] = (8, 16, 32),
         geometric_loss_weight: float = 0.1,
         chamfer_max_points: int = 1024,
+        stop_loss_weight: float = 1.0,
+        length_loss_weight: float = 0.0,
+        length_loss_type: str = "huber",
+        length_huber_delta: float = 10.0,
     ) -> None:
         """Vertex model conditioned on point clouds.
 
@@ -714,6 +755,10 @@ class PointCloudToVertexModel(VertexModel):
             gamma=gamma,
             geometric_loss_weight=geometric_loss_weight,
             chamfer_max_points=chamfer_max_points,
+            stop_loss_weight=stop_loss_weight,
+            length_loss_weight=length_loss_weight,
+            length_loss_type=length_loss_type,
+            length_huber_delta=length_huber_delta,
         )
         self.pc_encoder = APESPointCloudEncoder(
             hidden_size=self.embedding_dim,

@@ -25,6 +25,10 @@ VertexModelConfig:
   point_cloud_knn_scales: [ 8, 16, 32 ]
   geometric_loss_weight: 1000
   chamfer_max_points: 2048
+  stop_loss_weight: 3.0
+  length_loss_weight: 0.2
+  length_loss_type: "huber"
+  length_huber_delta: 10.0
   point_cloud_voxel_size: 0.01
   # Tallinn UTM coords: Y ~6.5e6, X ~5e5; must be > 6.6e6 to accept all points
   point_cloud_max_xyz_abs: 20000000.0
@@ -33,4 +37,6 @@ VertexModelConfig:
   # wandb 监控训练
   use_wandb: True
   wandb_project: "polygen-pointcloud"
+  early_stopping_patience: 10
+  early_stopping_min_delta: 0.0
   wandb_run_name: null # null 则自动生成

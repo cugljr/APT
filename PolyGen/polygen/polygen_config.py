@@ -33,6 +33,10 @@ class VertexModelConfig:
         point_cloud_knn_scales: Optional[list] = None,
         geometric_loss_weight: float = 0.1,
         chamfer_max_points: int = 1024,
+        stop_loss_weight: float = 1.0,
+        length_loss_weight: float = 0.0,
+        length_loss_type: str = "huber",
+        length_huber_delta: float = 10.0,
         point_cloud_voxel_size: float = 0.01,
         point_cloud_max_xyz_abs: float = 1e6,
         point_cloud_max_retry: int = 20,
@@ -41,6 +45,8 @@ class VertexModelConfig:
         use_wandb: bool = False,
         wandb_project: str = "polygen",
         wandb_run_name: Optional[str] = None,
+        early_stopping_patience: int = 10,
+        early_stopping_min_delta: float = 0.0,
     ) -> None:
         """Initializes vertex model and vertex data module
 
@@ -69,6 +75,10 @@ class VertexModelConfig:
             point_cloud_knn_scales: kNN neighborhood sizes for multi-scale point-cloud encoding
             geometric_loss_weight: Weight for Chamfer geometric consistency loss
             chamfer_max_points: Number of condition points used in Chamfer computation
+            stop_loss_weight: Weight for stop-token NLL term
+            length_loss_weight: Weight for vertex-count consistency loss
+            length_loss_type: Length loss type, one of {"huber", "l1"}
+            length_huber_delta: Huber delta for length loss
             point_cloud_voxel_size: Voxel size for point-cloud downsampling in paired dataset
             point_cloud_max_xyz_abs: Absolute-value cap when filtering invalid xyz rows
             point_cloud_max_retry: Retry count for skipping corrupted samples
@@ -76,6 +86,8 @@ class VertexModelConfig:
             use_wandb: Whether to use Weights & Biases for logging
             wandb_project: W&B project name
             wandb_run_name: W&B run name (None for auto)
+            early_stopping_patience: Early stopping patience on val_loss_mean
+            early_stopping_min_delta: Minimum delta for early stopping
         """
 
         self.gpu_ids = gpu_ids
@@ -83,6 +95,8 @@ class VertexModelConfig:
         self.use_wandb = use_wandb
         self.wandb_project = wandb_project
         self.wandb_run_name = wandb_run_name
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_min_delta = early_stopping_min_delta
         self.accelerator = accelerator
         if accelerator.startswith("ddp"):
             self.batch_size = batch_size // self.num_gpus
@@ -116,6 +130,10 @@ class VertexModelConfig:
                 knn_scales=tuple(point_cloud_knn_scales),
                 geometric_loss_weight=geometric_loss_weight,
                 chamfer_max_points=chamfer_max_points,
+                stop_loss_weight=stop_loss_weight,
+                length_loss_weight=length_loss_weight,
+                length_loss_type=length_loss_type,
+                length_huber_delta=length_huber_delta,
             )
         else:
             collate_method = CollateMethod.VERTICES
