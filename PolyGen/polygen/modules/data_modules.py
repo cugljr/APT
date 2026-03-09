@@ -417,6 +417,9 @@ class PolygenDataModule(pl.LightningDataModule):
         self.shuffle_vertices = shuffle_vertices
         self.max_vertices_per_sample = max_vertices_per_sample
 
+        # 标记是否已经将划分结果写入到 txt（避免重复写）
+        self._split_files_written: bool = False
+
         if collate_method == CollateMethod.VERTICES:
             self.collate_fn = self.collate_vertex_model_batch
         elif collate_method == CollateMethod.FACES:
@@ -604,6 +607,52 @@ class PolygenDataModule(pl.LightningDataModule):
         self.train_set, self.val_set, self.test_set = random_split(
             self.shapenet_dataset, [train_set_length, val_set_length, test_set_length]
         )
+
+        # 首次划分后，将对应的样本文件名写到 txt 里，便于复现与分析
+        if not self._split_files_written:
+            self._write_split_file_lists()
+            self._split_files_written = True
+
+    def _write_split_file_lists(self) -> None:
+        """将训练/验证/测试划分对应的文件名写入 txt."""
+        base_ds = self.shapenet_dataset
+
+        # 不同数据集类型的“文件名”获取方式不同
+        if isinstance(base_ds, PairedObjXyzDataset):
+            root_dir = base_ds.root_dir
+
+            def _line_for_idx(i: int) -> str:
+                mesh_path, xyz_path = base_ds.pairs[i]
+                return f"{os.path.basename(mesh_path)}\t{os.path.basename(xyz_path)}"
+
+        elif isinstance(base_ds, ShapenetDataset):
+            root_dir = base_ds.training_dir
+
+            def _line_for_idx(i: int) -> str:
+                return base_ds.all_files[i]
+
+        else:
+            # 兜底：只写索引
+            root_dir = getattr(self, "data_dir", ".")
+
+            def _line_for_idx(i: int) -> str:
+                return str(i)
+
+        def _dump_subset(subset, filename: str) -> None:
+            if subset is None or not hasattr(subset, "indices"):
+                return
+            out_path = os.path.join(root_dir, filename)
+            try:
+                with open(out_path, "w", encoding="utf-8") as f:
+                    for idx in subset.indices:
+                        f.write(_line_for_idx(int(idx)) + "\n")
+            except Exception:
+                # 不影响训练流程，写失败时静默跳过
+                pass
+
+        _dump_subset(self.train_set, "train_files.txt")
+        _dump_subset(self.val_set, "val_files.txt")
+        _dump_subset(self.test_set, "test_files.txt")
 
     def train_dataloader(self) -> DataLoader:
         """

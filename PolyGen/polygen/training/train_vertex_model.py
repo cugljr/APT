@@ -45,6 +45,52 @@ class ValidationResultsCallback(pl.Callback):
             writer.writerow(row)
 
 
+class LatestKCheckpointsCallback(pl.Callback):
+    """每个 epoch 保存一个 latest checkpoint，并只保留最近 K 个。"""
+
+    def __init__(self, ckpt_dir: str, keep_last_k: int = 5) -> None:
+        self.ckpt_dir = ckpt_dir
+        self.keep_last_k = keep_last_k
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+
+    @staticmethod
+    def _parse_epoch_from_name(filename: str) -> int:
+        # latest-epoch=0001.ckpt
+        try:
+            stem = os.path.splitext(os.path.basename(filename))[0]
+            prefix = "latest-epoch="
+            if not stem.startswith(prefix):
+                return -1
+            return int(stem[len(prefix) :])
+        except Exception:
+            return -1
+
+    def _prune(self) -> None:
+        files = []
+        for name in os.listdir(self.ckpt_dir):
+            if name.startswith("latest-epoch=") and name.endswith(".ckpt"):
+                epoch = self._parse_epoch_from_name(name)
+                if epoch >= 0:
+                    files.append((epoch, os.path.join(self.ckpt_dir, name)))
+        files.sort(key=lambda x: x[0])
+        if len(files) <= self.keep_last_k:
+            return
+        for _, path in files[: -self.keep_last_k]:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+
+    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        # 只在 rank0 保存/删除，避免 DDP 冲突
+        if not trainer.is_global_zero:
+            return
+        epoch = int(trainer.current_epoch)
+        ckpt_path = os.path.join(self.ckpt_dir, f"latest-epoch={epoch:04d}.ckpt")
+        trainer.save_checkpoint(ckpt_path)
+        self._prune()
+
+
 def main(config_name: str) -> None:
     with hydra.initialize_config_module(config_module="polygen.config"):
         cfg = hydra.compose(config_name=config_name)
@@ -88,38 +134,39 @@ def main(config_name: str) -> None:
             name=getattr(vertex_model_config, "wandb_run_name", None),
         )
 
-    ckpt_dir = "lightning_logs/checkpoints"
-    os.makedirs(ckpt_dir, exist_ok=True)
+    # 本地日志：每次 fit 自动创建 lightning_logs/<name>/version_x/
+    csv_logger = pl.loggers.CSVLogger(save_dir="lightning_logs", name="vertex_pointcloud")
+    log_dir = csv_logger.log_dir
+    ckpt_dir = os.path.join(log_dir, "checkpoints")
 
-    # 1. 验证 loss 最低的 1 个权重
+    # 1) 验证 loss 最低的 1 个权重
     best_ckpt = pl.callbacks.ModelCheckpoint(
         dirpath=ckpt_dir,
-        filename="best-val_loss={val_loss:.2f}-epoch={epoch:02d}",
-        monitor="val_loss",
+        filename="best-epoch={epoch:04d}-val_loss_mean={val_loss_mean:.4f}",
+        monitor="val_loss_mean",
         mode="min",
         save_top_k=1,
         every_n_epochs=1,
+        auto_insert_metric_name=False,
     )
-    # 2. 最新的 5 个权重（按 epoch 从大到小保留）
-    latest_ckpt = pl.callbacks.ModelCheckpoint(
-        dirpath=ckpt_dir,
-        filename="latest-epoch={epoch:02d}",
-        monitor="epoch",
-        mode="max",
-        save_top_k=5,
-        every_n_epochs=1,
-    )
-    # 3. 每个 epoch 保存验证结果到 CSV
-    val_results_cb = ValidationResultsCallback(save_dir="lightning_logs")
+    # 2) 最新的 5 个权重（每个 epoch 存一份，然后裁剪只保留最近 5 个）
+    latest_k_ckpt = LatestKCheckpointsCallback(ckpt_dir=ckpt_dir, keep_last_k=5)
+    # 3) 每个 epoch 保存验证结果到 CSV（写到当前 run 目录）
+    val_results_cb = ValidationResultsCallback(save_dir=log_dir)
+
+    # logger：本地 CSV + （可选）wandb
+    if logger is None:
+        loggers = csv_logger
+    else:
+        loggers = [csv_logger, logger]
 
     trainer = pl.Trainer(
         accelerator=accelerator,
         devices=devices,
         strategy=strategy,
         max_epochs=num_epochs,
-        logger=logger,
-        callbacks=[best_ckpt, latest_ckpt, val_results_cb],
-        default_root_dir="lightning_logs",
+        logger=loggers,
+        callbacks=[best_ckpt, latest_k_ckpt, val_results_cb],
     )
     trainer.fit(model=vertex_model, datamodule=vertex_data_module)
 

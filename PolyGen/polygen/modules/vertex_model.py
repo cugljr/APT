@@ -301,6 +301,10 @@ class VertexModel(pl.LightningModule):
         coord_targets = vertex_model_batch["vertices_zyx"]
         coord_mask = ((token_targets[:, :-1] == 1).to(torch.float32) * token_mask[:, :-1]).to(torch.float32)
 
+        eps = 1e-8
+        token_denom = torch.clamp(token_mask.sum(), min=eps)
+        coord_denom = torch.clamp(coord_mask.sum(), min=eps)
+
         stop_loss = -torch.sum(
             torch.distributions.categorical.Categorical(logits=logits["stop_logits"]).log_prob(token_targets)
             * token_mask
@@ -324,6 +328,14 @@ class VertexModel(pl.LightningModule):
             * coord_mask
         )
         vertex_loss = stop_loss + z_loss + y_loss + x_loss
+
+        # per-token mean losses (more interpretable than sums)
+        stop_loss_mean = stop_loss / token_denom
+        z_loss_mean = z_loss / coord_denom
+        y_loss_mean = y_loss / coord_denom
+        x_loss_mean = x_loss / coord_denom
+        vertex_loss_mean = stop_loss_mean + z_loss_mean + y_loss_mean + x_loss_mean
+
         geometric_loss = torch.tensor(0.0, device=vertex_loss.device)
         if self.geometric_loss_weight > 0 and "point_cloud" in vertex_model_batch:
             pred_xyz = self._predicted_vertices_xyz(logits)
@@ -333,12 +345,22 @@ class VertexModel(pl.LightningModule):
                 point_cloud=vertex_model_batch["point_cloud"].to(torch.float32),
             )
             vertex_loss = vertex_loss + self.geometric_loss_weight * geometric_loss
+        # keep original summed losses for backward-compatibility
         self.log("train_loss", vertex_loss)
         self.log("train_stop_loss", stop_loss)
         self.log("train_z_loss", z_loss)
         self.log("train_y_loss", y_loss)
         self.log("train_x_loss", x_loss)
         self.log("train_geo_loss", geometric_loss)
+
+        # new normalized metrics
+        self.log("train_loss_mean", vertex_loss_mean, prog_bar=True)
+        self.log("train_stop_loss_mean", stop_loss_mean)
+        self.log("train_z_loss_mean", z_loss_mean)
+        self.log("train_y_loss_mean", y_loss_mean)
+        self.log("train_x_loss_mean", x_loss_mean)
+        self.log("train_tokens", token_denom)
+        self.log("train_coord_tokens", coord_denom)
         return vertex_loss
 
     def configure_optimizers(self) -> Dict[str, Any]:
@@ -373,6 +395,10 @@ class VertexModel(pl.LightningModule):
             coord_targets = val_batch["vertices_zyx"]
             coord_mask = ((token_targets[:, :-1] == 1).to(torch.float32) * token_mask[:, :-1]).to(torch.float32)
 
+            eps = 1e-8
+            token_denom = torch.clamp(token_mask.sum(), min=eps)
+            coord_denom = torch.clamp(coord_mask.sum(), min=eps)
+
             stop_loss = -torch.sum(
                 torch.distributions.categorical.Categorical(logits=logits["stop_logits"]).log_prob(token_targets)
                 * token_mask
@@ -396,6 +422,13 @@ class VertexModel(pl.LightningModule):
                 * coord_mask
             )
             vertex_loss = stop_loss + z_loss + y_loss + x_loss
+
+            stop_loss_mean = stop_loss / token_denom
+            z_loss_mean = z_loss / coord_denom
+            y_loss_mean = y_loss / coord_denom
+            x_loss_mean = x_loss / coord_denom
+            vertex_loss_mean = stop_loss_mean + z_loss_mean + y_loss_mean + x_loss_mean
+
             geometric_loss = torch.tensor(0.0, device=vertex_loss.device)
             if self.geometric_loss_weight > 0 and "point_cloud" in val_batch:
                 pred_xyz = self._predicted_vertices_xyz(logits)
@@ -411,6 +444,14 @@ class VertexModel(pl.LightningModule):
         self.log("val_y_loss", y_loss)
         self.log("val_x_loss", x_loss)
         self.log("val_geo_loss", geometric_loss)
+
+        self.log("val_loss_mean", vertex_loss_mean, prog_bar=True)
+        self.log("val_stop_loss_mean", stop_loss_mean)
+        self.log("val_z_loss_mean", z_loss_mean)
+        self.log("val_y_loss_mean", y_loss_mean)
+        self.log("val_x_loss_mean", x_loss_mean)
+        self.log("val_tokens", token_denom)
+        self.log("val_coord_tokens", coord_denom)
         return vertex_loss
 
     def sample(

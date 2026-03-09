@@ -2,7 +2,7 @@ VertexModelConfig:
   _target_: polygen.polygen_config.VertexModelConfig
   # 单卡训练用 auto，多卡再改 ddp
   accelerator: auto
-  gpu_ids: [ 1 ]
+  gpu_ids: [ 0 ]
   dataset_path: "/home/kemove/devdata1/ljr/dataset/Tallinn"
   batch_size: 12
   training_split: 0.80
@@ -14,17 +14,17 @@ VertexModelConfig:
   num_classes: 55
   max_num_input_verts: 800
   use_discrete_embeddings: True
-  learning_rate: 3e-4
+  learning_rate: 1e-4
   step_size: 5000
   gamma: 0.995
-  training_steps: 200000
+  training_steps: 150000
   image_model: False
   point_cloud_model: True
   num_input_points: 2048
   num_context_tokens: 256
   point_cloud_knn_scales: [ 8, 16, 32 ]
-  geometric_loss_weight: 0.1
-  chamfer_max_points: 1024
+  geometric_loss_weight: 1000
+  chamfer_max_points: 2048
   point_cloud_voxel_size: 0.01
   # Tallinn UTM coords: Y ~6.5e6, X ~5e5; must be > 6.6e6 to accept all points
   point_cloud_max_xyz_abs: 20000000.0
@@ -33,4 +33,4 @@ VertexModelConfig:
   # wandb 监控训练
   use_wandb: True
   wandb_project: "polygen-pointcloud"
-  wandb_run_name: null  # null 则自动生成
+  wandb_run_name: null # null 则自动生成
