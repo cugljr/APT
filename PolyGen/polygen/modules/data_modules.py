@@ -379,7 +379,9 @@ class PolygenDataModule(pl.LightningDataModule):
         # class-conditioned vertices. It should be for image-conditioned vertices
         # or vertex-conditioned faces
         assert (not use_image_dataset) or (collate_method == CollateMethod.IMAGES)
-        assert (not use_point_cloud_dataset) or (collate_method == CollateMethod.POINT_CLOUD)
+        assert (not use_point_cloud_dataset) or (
+            collate_method in [CollateMethod.POINT_CLOUD, CollateMethod.FACES]
+        )
         assert not (use_image_dataset and use_point_cloud_dataset)
         assert (training_split + val_split) <= 1.0
 
@@ -485,6 +487,9 @@ class PolygenDataModule(pl.LightningDataModule):
         face_vertices = torch.zeros([num_elements, max_vertices, 3])
         face_vertices_mask = torch.zeros([num_elements, max_vertices], dtype=torch.int32)
         faces_mask = torch.zeros_like(shuffled_faces, dtype=torch.int32)
+        has_point_cloud = all("point_cloud" in element for element in ds)
+        if has_point_cloud:
+            point_clouds = torch.stack([element["point_cloud"] for element in ds], dim=0).to(torch.float32)
 
         for i, element in enumerate(ds):
             vertices = element["vertices"]
@@ -521,6 +526,8 @@ class PolygenDataModule(pl.LightningDataModule):
         face_model_batch["vertices"] = face_vertices
         face_model_batch["vertices_mask"] = face_vertices_mask
         face_model_batch["faces_mask"] = faces_mask
+        if has_point_cloud:
+            face_model_batch["point_cloud"] = point_clouds
         return face_model_batch
 
     def collate_img_model_batch(self, ds: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:

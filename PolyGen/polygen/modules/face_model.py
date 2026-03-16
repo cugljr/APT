@@ -11,6 +11,7 @@ from polygen.utils.data_utils import quantize_verts
 
 from .polygen_encoder import PolygenEncoder
 from .polygen_decoder import TransformerDecoder
+from .point_cloud_encoder import APESPointCloudEncoder
 from .utils import top_k_logits, top_p_logits
 
 
@@ -454,3 +455,56 @@ class FaceModel(pl.LightningModule):
         }
 
         return outputs
+
+
+class PointCloudToFaceModel(FaceModel):
+    def __init__(
+        self,
+        encoder_config: Dict[str, Any],
+        decoder_config: Dict[str, Any],
+        class_conditional: bool = False,
+        num_classes: int = 55,
+        decoder_cross_attention: bool = True,
+        use_discrete_vertex_embeddings: bool = True,
+        quantization_bits: int = 8,
+        max_seq_length: int = 5000,
+        learning_rate: float = 3e-4,
+        step_size: int = 5000,
+        gamma: float = 0.9995,
+        num_context_tokens: int = 256,
+        knn_scales: Tuple[int, ...] = (8, 16, 32),
+    ) -> None:
+        super(PointCloudToFaceModel, self).__init__(
+            encoder_config=encoder_config,
+            decoder_config=decoder_config,
+            class_conditional=class_conditional,
+            num_classes=num_classes,
+            decoder_cross_attention=decoder_cross_attention,
+            use_discrete_vertex_embeddings=use_discrete_vertex_embeddings,
+            quantization_bits=quantization_bits,
+            max_seq_length=max_seq_length,
+            learning_rate=learning_rate,
+            step_size=step_size,
+            gamma=gamma,
+        )
+        self.pc_encoder = APESPointCloudEncoder(
+            hidden_size=self.embedding_dim,
+            num_context_tokens=num_context_tokens,
+            knn_scales=knn_scales,
+        )
+
+    def _prepare_context(
+        self, context: Dict[str, Any]
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        vertex_embeddings, global_context_embedding, sequential_context_embeddings = super(
+            PointCloudToFaceModel, self
+        )._prepare_context(context)
+        if not self.decoder_cross_attention:
+            return vertex_embeddings, global_context_embedding, sequential_context_embeddings
+        if "point_cloud" not in context:
+            raise KeyError("PointCloudToFaceModel requires `point_cloud` in the batch context.")
+        point_cloud_context = self.pc_encoder(context["point_cloud"])
+        sequential_context_embeddings = torch.cat(
+            [sequential_context_embeddings, point_cloud_context], dim=1
+        )
+        return vertex_embeddings, global_context_embedding, sequential_context_embeddings

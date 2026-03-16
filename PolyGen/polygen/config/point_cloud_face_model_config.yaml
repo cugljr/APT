@@ -1,0 +1,42 @@
+FaceModelConfig:
+  _target_: polygen.polygen_config.FaceModelConfig
+  accelerator: "auto"
+  gpu_ids: [0]
+  dataset_path: "/home/kemove/devdata1/ljr/dataset/Tallinn"
+  batch_size: 8
+  training_split: 0.80
+  val_split: 0.10
+  apply_random_shift: False
+  shuffle_vertices: True
+  encoder_config:
+    {
+      "hidden_size": 256,
+      "fc_size": 1024,
+      "num_layers": 12,
+      "dropout_rate": 0.2
+    }
+  decoder_config:
+    {
+      "hidden_size": 256,
+      "fc_size": 1024,
+      "num_layers": 12,
+      "dropout_rate": 0.2
+    }
+  class_conditional: False
+  num_classes: 4
+  decoder_cross_attention: True
+  use_discrete_vertex_embeddings: True
+  quantization_bits: 8
+  max_seq_length: 2800
+  learning_rate: 3e-4
+  step_size: 5000
+  gamma: 0.995
+  training_steps: 200000
+  point_cloud_model: True
+  num_input_points: 2048
+  num_context_tokens: 256
+  point_cloud_knn_scales: [8, 16, 32]
+  point_cloud_voxel_size: 0.01
+  point_cloud_max_xyz_abs: 1000000.0
+  point_cloud_max_retry: 20
+  point_cloud_bad_sample_log_file: "bad_xyz_samples.log"

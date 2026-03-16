@@ -3,7 +3,7 @@ from typing import Any, Dict, Optional
 import torch
 
 from polygen.modules.vertex_model import VertexModel, ImageToVertexModel, PointCloudToVertexModel
-from polygen.modules.face_model import FaceModel
+from polygen.modules.face_model import FaceModel, PointCloudToFaceModel
 from polygen.modules.data_modules import PolygenDataModule, CollateMethod
 
 
@@ -192,6 +192,14 @@ class FaceModelConfig:
         step_size: int,
         gamma: float,
         training_steps: int,
+        point_cloud_model: bool = False,
+        num_input_points: int = 2048,
+        num_context_tokens: int = 256,
+        point_cloud_knn_scales: Optional[list] = None,
+        point_cloud_voxel_size: float = 0.01,
+        point_cloud_max_xyz_abs: float = 1e6,
+        point_cloud_max_retry: int = 20,
+        point_cloud_bad_sample_log_file: str = "bad_xyz_samples.log",
         gpu_ids: Optional[list] = None,
     ):
         """Initializes face model and face data module
@@ -217,6 +225,14 @@ class FaceModelConfig:
             step_size: How often to use lr scheduler
             gamma: Decay rate for lr scheduler
             training_steps: How many total steps we want to train for
+            point_cloud_model: Whether to train face model with paired point-cloud condition
+            num_input_points: Number of point-cloud samples per object
+            num_context_tokens: Number of point-cloud context tokens for cross-attention
+            point_cloud_knn_scales: kNN scales used in point-cloud encoder
+            point_cloud_voxel_size: Voxel size for point-cloud downsampling
+            point_cloud_max_xyz_abs: Absolute-value cap when filtering invalid xyz rows
+            point_cloud_max_retry: Retry count for skipping corrupted samples
+            point_cloud_bad_sample_log_file: Log file name for rejected xyz samples
         """
 
         self.gpu_ids = gpu_ids
@@ -234,23 +250,48 @@ class FaceModelConfig:
             training_split = training_split,
             val_split = val_split,
             quantization_bits = quantization_bits,
+            use_point_cloud_dataset = point_cloud_model,
+            num_input_points = num_input_points,
+            point_cloud_voxel_size = point_cloud_voxel_size,
+            point_cloud_max_xyz_abs = point_cloud_max_xyz_abs,
+            point_cloud_max_retry = point_cloud_max_retry,
+            point_cloud_bad_sample_log_file = point_cloud_bad_sample_log_file,
             apply_random_shift_faces = apply_random_shift,
             shuffle_vertices = shuffle_vertices,
         )
 
-        self.face_model = FaceModel(
-            encoder_config = encoder_config,
-            decoder_config = decoder_config,
-            class_conditional = class_conditional,
-            num_classes = num_classes,
-            decoder_cross_attention = decoder_cross_attention,
-            use_discrete_vertex_embeddings = use_discrete_vertex_embeddings,
-            quantization_bits = quantization_bits,
-            max_seq_length = max_seq_length,
-            learning_rate = learning_rate,
-            step_size = step_size,
-            gamma = gamma,
-        )
+        if point_cloud_model:
+            if point_cloud_knn_scales is None:
+                point_cloud_knn_scales = [8, 16, 32]
+            self.face_model = PointCloudToFaceModel(
+                encoder_config=encoder_config,
+                decoder_config=decoder_config,
+                class_conditional=class_conditional,
+                num_classes=num_classes,
+                decoder_cross_attention=decoder_cross_attention,
+                use_discrete_vertex_embeddings=use_discrete_vertex_embeddings,
+                quantization_bits=quantization_bits,
+                max_seq_length=max_seq_length,
+                learning_rate=learning_rate,
+                step_size=step_size,
+                gamma=gamma,
+                num_context_tokens=num_context_tokens,
+                knn_scales=tuple(point_cloud_knn_scales),
+            )
+        else:
+            self.face_model = FaceModel(
+                encoder_config = encoder_config,
+                decoder_config = decoder_config,
+                class_conditional = class_conditional,
+                num_classes = num_classes,
+                decoder_cross_attention = decoder_cross_attention,
+                use_discrete_vertex_embeddings = use_discrete_vertex_embeddings,
+                quantization_bits = quantization_bits,
+                max_seq_length = max_seq_length,
+                learning_rate = learning_rate,
+                step_size = step_size,
+                gamma = gamma,
+            )
         
         self.training_steps = training_steps
 
