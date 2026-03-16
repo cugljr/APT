@@ -379,9 +379,7 @@ class PolygenDataModule(pl.LightningDataModule):
         # class-conditioned vertices. It should be for image-conditioned vertices
         # or vertex-conditioned faces
         assert (not use_image_dataset) or (collate_method == CollateMethod.IMAGES)
-        assert (not use_point_cloud_dataset) or (
-            collate_method in [CollateMethod.POINT_CLOUD, CollateMethod.FACES]
-        )
+        assert (not use_point_cloud_dataset) or (collate_method == CollateMethod.POINT_CLOUD)
         assert not (use_image_dataset and use_point_cloud_dataset)
         assert (training_split + val_split) <= 1.0
 
@@ -487,9 +485,6 @@ class PolygenDataModule(pl.LightningDataModule):
         face_vertices = torch.zeros([num_elements, max_vertices, 3])
         face_vertices_mask = torch.zeros([num_elements, max_vertices], dtype=torch.int32)
         faces_mask = torch.zeros_like(shuffled_faces, dtype=torch.int32)
-        has_point_cloud = all("point_cloud" in element for element in ds)
-        if has_point_cloud:
-            point_clouds = torch.stack([element["point_cloud"] for element in ds], dim=0).to(torch.float32)
 
         for i, element in enumerate(ds):
             vertices = element["vertices"]
@@ -526,8 +521,6 @@ class PolygenDataModule(pl.LightningDataModule):
         face_model_batch["vertices"] = face_vertices
         face_model_batch["vertices_mask"] = face_vertices_mask
         face_model_batch["faces_mask"] = faces_mask
-        if has_point_cloud:
-            face_model_batch["point_cloud"] = point_clouds
         return face_model_batch
 
     def collate_img_model_batch(self, ds: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
@@ -607,18 +600,28 @@ class PolygenDataModule(pl.LightningDataModule):
 
     def setup(self, stage: Optional = None) -> None:
         """Pytorch Lightning Data Module setup method"""
-        num_files = len(self.shapenet_dataset)
+        base_ds = self.shapenet_dataset
+
+        # 1) 如果存在之前写出的 train/val/test txt，则按 txt 固定划分
+        if not self._split_files_written:
+            if self._load_split_from_files(base_ds):
+                self._split_files_written = True
+                return
+
+        # 2) 否则按比例随机划分一次，并写出 txt 供之后复现
+        num_files = len(base_ds)
         train_set_length = int(num_files * self.training_split)
         val_set_length = int(num_files * self.val_split)
         test_set_length = num_files - train_set_length - val_set_length
         self.train_set, self.val_set, self.test_set = random_split(
-            self.shapenet_dataset, [train_set_length, val_set_length, test_set_length]
+            base_ds, [train_set_length, val_set_length, test_set_length]
         )
 
-        # 首次划分后，将对应的样本文件名写到 txt 里，便于复现与分析
         if not self._split_files_written:
             self._write_split_file_lists()
             self._split_files_written = True
+
+    # ---- 划分结果写入 / 读回 ----
 
     def _write_split_file_lists(self) -> None:
         """将训练/验证/测试划分对应的文件名写入 txt."""
@@ -660,6 +663,79 @@ class PolygenDataModule(pl.LightningDataModule):
         _dump_subset(self.train_set, "train_files.txt")
         _dump_subset(self.val_set, "val_files.txt")
         _dump_subset(self.test_set, "test_files.txt")
+
+    def _load_split_from_files(self, base_ds: Dataset) -> bool:
+        """如果存在 train/val/test txt，则按照其中记录的样本恢复划分。
+
+        返回:
+            bool: True 表示成功从 txt 恢复划分；False 表示未恢复（将继续使用随机划分）。
+        """
+        # 根据数据集类型确定根目录与 key 生成方式
+        if isinstance(base_ds, PairedObjXyzDataset):
+            root_dir = base_ds.root_dir
+
+            def _key_for_idx(i: int) -> str:
+                mesh_path, xyz_path = base_ds.pairs[i]
+                return f"{os.path.basename(mesh_path)}\t{os.path.basename(xyz_path)}"
+
+        elif isinstance(base_ds, ShapenetDataset):
+            root_dir = base_ds.training_dir
+
+            def _key_for_idx(i: int) -> str:
+                return base_ds.all_files[i]
+
+        else:
+            root_dir = getattr(self, "data_dir", ".")
+
+            def _key_for_idx(i: int) -> str:
+                return str(i)
+
+        train_path = os.path.join(root_dir, "train_files.txt")
+        val_path = os.path.join(root_dir, "val_files.txt")
+        test_path = os.path.join(root_dir, "test_files.txt")
+        if not (os.path.exists(train_path) and os.path.exists(val_path) and os.path.exists(test_path)):
+            return False
+
+        try:
+            def _read_lines(p: str) -> List[str]:
+                with open(p, "r", encoding="utf-8") as f:
+                    return [ln.rstrip("\n") for ln in f if ln.strip()]
+
+            train_keys = _read_lines(train_path)
+            val_keys = _read_lines(val_path)
+            test_keys = _read_lines(test_path)
+        except Exception:
+            return False
+
+        # 为当前数据集构建 key -> index 映射
+        index_map: Dict[str, int] = {}
+        for i in range(len(base_ds)):
+            k = _key_for_idx(i)
+            # 如果 key 重复，只保留第一个
+            if k not in index_map:
+                index_map[k] = i
+
+        def _map_keys_to_indices(keys: List[str]) -> List[int]:
+            idxs: List[int] = []
+            for k in keys:
+                if k in index_map:
+                    idxs.append(index_map[k])
+            return idxs
+
+        train_indices = _map_keys_to_indices(train_keys)
+        val_indices = _map_keys_to_indices(val_keys)
+        test_indices = _map_keys_to_indices(test_keys)
+
+        # 至少要有训练集索引，否则认为恢复失败
+        if not train_indices:
+            return False
+
+        from torch.utils.data import Subset
+
+        self.train_set = Subset(base_ds, train_indices)
+        self.val_set = Subset(base_ds, val_indices) if val_indices else None
+        self.test_set = Subset(base_ds, test_indices) if test_indices else None
+        return True
 
     def train_dataloader(self) -> DataLoader:
         """
